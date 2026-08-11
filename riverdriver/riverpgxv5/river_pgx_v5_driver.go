@@ -16,6 +16,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -30,6 +31,7 @@ import (
 	"github.com/riverqueue/river/rivershared/uniquestates"
 	"github.com/riverqueue/river/rivershared/util/dbutil"
 	"github.com/riverqueue/river/rivershared/util/ptrutil"
+	"github.com/riverqueue/river/rivershared/util/randutil"
 	"github.com/riverqueue/river/rivershared/util/sliceutil"
 	"github.com/riverqueue/river/rivertype"
 )
@@ -39,8 +41,10 @@ var migrationFS embed.FS
 
 // Driver is an implementation of riverdriver.Driver for Pgx v5.
 type Driver struct {
-	dbPool   *pgxpool.Pool
-	replacer sqlctemplate.Replacer
+	dbPool                 *pgxpool.Pool
+	replacer               sqlctemplate.Replacer
+	uniqueInsertMode       atomic.Uint32
+	uniqueInsertModeInitMu sync.Mutex
 }
 
 // New returns a new Pgx v5 River driver for use with River.
@@ -366,6 +370,16 @@ func (e *Executor) JobGetStuck(ctx context.Context, params *riverdriver.JobGetSt
 }
 
 func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.JobInsertFastManyParams) ([]*riverdriver.JobInsertFastResult, error) {
+	uniqueInsertMode, err := e.uniqueInsertMode(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var uniqueNonce string
+	if uniqueInsertMode == riverdriver.UniqueInsertModeMetadataNonce {
+		uniqueNonce = randutil.Hex(8)
+	}
+
 	insertJobsParams := &dbsqlc.JobInsertFastManyParams{
 		ID:           make([]int64, len(params.Jobs)),
 		Args:         make([][]byte, len(params.Jobs)),
@@ -407,7 +421,16 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.Jo
 		insertJobsParams.CreatedAt[i] = createdAt
 		insertJobsParams.Kind[i] = params.Kind
 		insertJobsParams.MaxAttempts[i] = int16(min(params.MaxAttempts, math.MaxInt16)) //nolint:gosec
-		insertJobsParams.Metadata[i] = sliceutil.FirstNonEmpty(params.Metadata, defaultObject)
+		metadata := sliceutil.FirstNonEmpty(params.Metadata, defaultObject)
+		if uniqueNonce != "" {
+			var err error
+			metadata, err = riverdriver.UniqueInsertMetadataWithNonce(metadata, uniqueNonce)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		insertJobsParams.Metadata[i] = metadata
 		insertJobsParams.Priority[i] = int16(min(params.Priority, math.MaxInt16)) //nolint:gosec
 		insertJobsParams.Queue[i] = params.Queue
 		insertJobsParams.ScheduledAt[i] = scheduledAt
@@ -417,6 +440,9 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.Jo
 		insertJobsParams.UniqueStates[i] = int32(params.UniqueStates)
 	}
 
+	ctx = sqlctemplate.WithReplacements(ctx, map[string]sqlctemplate.Replacement{
+		"unique_skipped_as_duplicate": {Value: uniqueInsertMode.SQL(), Stable: true},
+	}, nil)
 	items, err := dbsqlc.New().JobInsertFastMany(schemaTemplateParam(ctx, params.Schema), e.dbtx, insertJobsParams)
 	if err != nil {
 		return nil, interpretError(err)
@@ -427,7 +453,13 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.Jo
 		if err != nil {
 			return nil, err
 		}
-		return &riverdriver.JobInsertFastResult{Job: job, UniqueSkippedAsDuplicate: row.UniqueSkippedAsDuplicate}, nil
+
+		uniqueSkippedAsDuplicate := row.UniqueSkippedAsDuplicate
+		if uniqueInsertMode == riverdriver.UniqueInsertModeMetadataNonce {
+			uniqueSkippedAsDuplicate = riverdriver.UniqueInsertMetadataIsDuplicate(job.Metadata, uniqueNonce)
+		}
+
+		return &riverdriver.JobInsertFastResult{Job: job, UniqueSkippedAsDuplicate: uniqueSkippedAsDuplicate}, nil
 	})
 }
 
@@ -1033,6 +1065,32 @@ func (e *Executor) TableTruncate(ctx context.Context, params *riverdriver.TableT
 		),
 	)
 	return interpretError(err)
+}
+
+func (e *Executor) uniqueInsertMode(ctx context.Context) (riverdriver.UniqueInsertMode, error) {
+	if e.driver != nil {
+		if mode := riverdriver.UniqueInsertMode(e.driver.uniqueInsertMode.Load()); mode != riverdriver.UniqueInsertModeUnknown {
+			return mode, nil
+		}
+
+		e.driver.uniqueInsertModeInitMu.Lock()
+		defer e.driver.uniqueInsertModeInitMu.Unlock()
+
+		if mode := riverdriver.UniqueInsertMode(e.driver.uniqueInsertMode.Load()); mode != riverdriver.UniqueInsertModeUnknown {
+			return mode, nil
+		}
+	}
+
+	productAndVersion, err := dbsqlc.New().PGGetProductAndVersion(ctx, e.dbtx)
+	if err != nil {
+		return riverdriver.UniqueInsertModeUnknown, interpretError(err)
+	}
+
+	mode := riverdriver.UniqueInsertModeFromProductAndVersion(productAndVersion.Product, productAndVersion.VersionNum)
+	if e.driver != nil {
+		e.driver.uniqueInsertMode.Store(uint32(mode))
+	}
+	return mode, nil
 }
 
 type ExecutorTx struct {

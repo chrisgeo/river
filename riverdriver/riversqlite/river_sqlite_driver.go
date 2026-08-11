@@ -37,10 +37,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
-
-	"github.com/riverqueue/river/internal/rivercommon"
 	"github.com/riverqueue/river/riverdriver"
 	"github.com/riverqueue/river/riverdriver/riversqlite/internal/dbsqlc"
 	"github.com/riverqueue/river/rivershared/sqlctemplate"
@@ -598,7 +594,7 @@ func (e *Executor) JobInsertFastMany(ctx context.Context, params *riverdriver.Jo
 
 		return &riverdriver.JobInsertFastResult{
 			Job:                      job,
-			UniqueSkippedAsDuplicate: gjson.GetBytes(job.Metadata, rivercommon.MetadataKeyUniqueNonce).Str != uniqueNonce,
+			UniqueSkippedAsDuplicate: riverdriver.UniqueInsertMetadataIsDuplicate(job.Metadata, uniqueNonce),
 		}, nil
 	})
 }
@@ -1526,7 +1522,7 @@ func sqliteJobInsertFastManyJobsParam(jobs []*riverdriver.JobInsertFastParams, u
 		metadata := sliceutil.FirstNonEmpty(job.Metadata, []byte("{}"))
 		if uniqueNonce != "" {
 			var err error
-			metadata, err = sjson.SetBytes(metadata, rivercommon.MetadataKeyUniqueNonce, uniqueNonce)
+			metadata, err = riverdriver.UniqueInsertMetadataWithNonce(metadata, uniqueNonce)
 			if err != nil {
 				return nil, err
 			}
