@@ -71,6 +71,79 @@ class WorkersTest {
               .getMessage());
   }
 
+  @Test
+  void cancellationContinuesWhileFetchingIsBlocked() throws Exception {
+    var entered = new CompletableFuture<Void>();
+    var fetching = new CompletableFuture<Void>();
+    var release = new CompletableFuture<Void>();
+    var cancelled = new CompletableFuture<WorkContext.Cancellation>();
+    var client =
+        client()
+            .withPlugin(
+                new Plugin() {
+                  @Override
+                  public int workerLimit(String queue, int configured) {
+                    if (entered.isDone()) {
+                      fetching.complete(null);
+                      release.join();
+                    }
+                    return configured;
+                  }
+                });
+    var workers =
+        workers(client)
+            .pollInterval(Duration.ofMillis(10))
+            .add(
+                TYPE,
+                context -> {
+                  entered.complete(null);
+                  context.awaitCancellation();
+                  cancelled.complete(context.cancellation());
+                  context.checkCancelled();
+                })
+            .start();
+    try {
+      var inserted = client.insert(TYPE, "cancel while fetching").job();
+      fetching.get(5, TimeUnit.SECONDS);
+      client.cancel(inserted.id());
+      assertEquals(WorkContext.Cancellation.REMOTE, cancelled.get(5, TimeUnit.SECONDS));
+    } finally {
+      release.complete(null);
+      workers.stopAndCancel();
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void cancellationContinuesAfterGracefulStop(boolean pollOnly) throws Exception {
+    var client = client();
+    var entered = new CompletableFuture<WorkContext<String>>();
+    var outcome = new CompletableFuture<Workers.Event>();
+    var workers =
+        workers(client)
+            .pollOnly(pollOnly)
+            .add(
+                TYPE,
+                context -> {
+                  entered.complete(context);
+                  context.awaitCancellation();
+                  context.checkCancelled();
+                })
+            .start();
+    try (var subscription = workers.subscribe(outcome::complete)) {
+      var inserted = client.insert(TYPE, "cancel while draining").job();
+      entered.get(5, TimeUnit.SECONDS);
+      // The timeout leaves active work draining after the dispatcher and
+      // listener have stopped. A peer can still cancel that work.
+      assertThrows(RiverException.class, workers::stop);
+      client.cancel(inserted.id());
+      assertEquals(Job.State.CANCELLED, outcome.get(5, TimeUnit.SECONDS).job().state());
+      workers.stop();
+    } finally {
+      workers.stopAndCancel();
+    }
+  }
+
   @ParameterizedTest
   @CsvSource({"REMOTE,false", "REMOTE,true", "TIMEOUT,false", "TIMEOUT,true"})
   void cancellationRespectsTheHandlersOutcome(WorkContext.Cancellation cause, boolean interrupted)

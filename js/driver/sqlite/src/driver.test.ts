@@ -326,8 +326,10 @@ describe("SqliteDriver", () => {
 
     const retried = await driver.jobRetryDetailed(inserted.id, { now });
     expect(retried.status).toBe("retried");
-    if (retried.status === "retried")
+    if (retried.status === "retried") {
       expect(retried.job.state).toBe("available");
+      expect(retried.job.metadata).not.toHaveProperty("cancel_attempted_at");
+    }
     expect((await driver.jobRetryDetailed(inserted.id, { now })).status).toBe(
       "unchanged"
     );
@@ -349,6 +351,34 @@ describe("SqliteDriver", () => {
       `{"action":"cancel","job_id":${inserted.id},"queue":"default"}`
     );
   });
+
+  test.each(["[not json", "null", '["cancel_attempted_at"]'])(
+    "retries jobs without changing malformed metadata: %s",
+    async (metadata) => {
+      const { database, driver } = await setup();
+      const { job } = await driver.jobInsert({
+        args: {},
+        finalizedAt: Temporal.Now.instant(),
+        kind: "retry_metadata",
+        state: "discarded",
+      });
+      database
+        .prepare("UPDATE river_job SET metadata = ? WHERE id = ?")
+        .run(metadata, job.id);
+
+      expect(await driver.jobRetryDetailed(job.id)).toMatchObject({
+        job: { id: job.id, state: "available" },
+        status: "retried",
+      });
+      expect(
+        database
+          .prepare(
+            "SELECT CASE WHEN typeof(metadata) = 'text' THEN metadata ELSE json(metadata) END AS metadata FROM river_job WHERE id = ?"
+          )
+          .get(job.id)?.metadata
+      ).toBe(metadata);
+    }
+  );
 
   test("notifies a running job's cancellation in the cancelling transaction, like Go", async () => {
     const { database, driver } = await setup();

@@ -483,6 +483,34 @@ RSpec.shared_examples "driver job state machine" do
     expect(driver.job_retry(-1)).to be_nil
   end
 
+  it "preserves malformed SQLite metadata and reports its decoding error", database: :sqlite do
+    skip "requires SQLite" if driver.send(:runtime_postgres?)
+
+    job = insert_job(1, scheduled_at: now + 60)
+    driver.send(:runtime_execute, "UPDATE river_job SET metadata = '[not json' WHERE id = #{job.id}")
+
+    expect { driver.job_retry(job.id, now: now) }.to raise_error(River::JobRowDecodeError, /metadata/)
+    row = driver.send(:runtime_query_rows, "SELECT metadata FROM river_job WHERE id = #{job.id}").first
+    expect(driver.send(:runtime_value, row, :metadata)).to eq("[not json")
+  end
+
+  [nil, 42, false, "cancel_attempted_at", ["cancel_attempted_at"]].each do |metadata|
+    it "preserves non-object metadata #{metadata.inspect} when retrying" do
+      job = insert_job(1, scheduled_at: now + 60)
+      encoded = driver.send(:runtime_json, JSON.generate(metadata))
+      driver.send(:runtime_execute, "UPDATE river_job SET metadata = #{encoded} WHERE id = #{job.id}")
+
+      if metadata.nil?
+        expect(driver.job_retry(job.id, now: now)).to have_attributes(state: "available")
+      else
+        expect { driver.job_retry(job.id, now: now) }.to raise_error(River::JobRowDecodeError)
+      end
+      column = driver.send(:runtime_postgres?) ? "metadata::text" : "json(metadata)"
+      row = driver.send(:runtime_query_rows, "SELECT #{column} AS metadata FROM river_job WHERE id = #{job.id}").first
+      expect(JSON.parse(driver.send(:runtime_value, row, :metadata))).to eq(metadata)
+    end
+  end
+
   it "rejects manual retries after the last representable attempt without changing the job" do
     job = insert_job(1, max_attempts: 32_767)
     original = client.job_update(job.id, attempt: 32_767, finalized_at: now, state: :discarded)

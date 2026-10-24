@@ -546,6 +546,7 @@ macro_rules! scenarios {
             .unwrap();
             let retried = jobs.retry(cancelled).tx(&mut tx).await.unwrap();
             assert_eq!(retried.state, JobState::Available);
+            assert!(!retried.metadata.contains_key("cancel_attempted_at"));
             tx.commit().await.unwrap();
 
             assert_eq!(

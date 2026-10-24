@@ -943,6 +943,8 @@ pub(crate) async fn retry(
                 ELSE max_attempts
             END,
             finalized_at = NULL,
+            metadata = CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata)
+                THEN metadata ELSE jsonb_remove(metadata, '$.cancel_attempted_at') END,
             scheduled_at = ?
         WHERE id = ?
           AND state != 'running'
@@ -2521,6 +2523,30 @@ mod tests {
         }
         let row = get(&mut connection, inserted.id).await.unwrap().unwrap();
         assert_eq!(row.attempted_by, ["three", "four", "five"]);
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_malformed_metadata_for_row_validation() {
+        let pool = setup().await;
+        let mut connection = pool.acquire().await.unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let job = insert_test_job(&mut connection, JobState::Retryable, now).await;
+        sqlx::query("UPDATE river_job SET metadata = '[not json' WHERE id = ?")
+            .bind(job.id)
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+
+        let error = retry(&mut connection, job.id, now).await.unwrap_err();
+        assert!(
+            matches!(error, BackendError::InvalidRow(ref message) if message.contains("metadata"))
+        );
+        let metadata: String = sqlx::query_scalar("SELECT metadata FROM river_job WHERE id = ?")
+            .bind(job.id)
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        assert_eq!(metadata, "[not json");
     }
 
     /// Inserts a job for the undecodable row tests.

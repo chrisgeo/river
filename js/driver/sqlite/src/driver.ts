@@ -1446,6 +1446,10 @@ export class SqliteRuntime implements RuntimeDriver<
             ELSE max_attempts
           END,
           finalized_at = NULL,
+          metadata = CASE
+            WHEN ${invalidJsonTextSql("metadata")} THEN metadata
+            ELSE jsonb_remove(metadata, '$.cancel_attempted_at')
+          END,
           scheduled_at = ?
         WHERE id = ?
           AND state != 'running'

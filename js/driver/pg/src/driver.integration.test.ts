@@ -536,6 +536,7 @@ describe("PgDriver integration", () => {
     const now = Temporal.Instant.from("2026-08-30T12:00:00.123456Z");
     const retryable = await driver.jobInsert(
       insertParams(`${filePrefix}_retry`, {
+        metadata: { cancel_attempted_at: now.toString(), preserved: true },
         scheduledAt,
         state: "retryable",
       })
@@ -558,6 +559,7 @@ describe("PgDriver integration", () => {
     });
 
     expect(retried!.state).toBe("available");
+    expect(retried!.metadata).toEqual({ preserved: true });
     expect(retried!.scheduledAt.toString()).toBe("2026-08-30T12:00:00.123456Z");
     expect(unchanged!.state).toBe("running");
   });
@@ -632,6 +634,29 @@ describe("PgDriver integration", () => {
       }
     );
   });
+
+  it.each(["null", "42", '"cancel_attempted_at"', '["cancel_attempted_at"]'])(
+    "retries jobs without changing non-object metadata: %s",
+    async (metadata) => {
+      const { job } = await driver.jobInsert(
+        insertParams(`${filePrefix}_retry_metadata`, { state: "retryable" })
+      );
+      await pool.query(
+        "UPDATE river_job SET metadata = $1::jsonb WHERE id = $2::bigint",
+        [metadata, job.id.toString()]
+      );
+
+      expect(await driver.jobRetry(job.id)).toMatchObject({
+        id: job.id,
+        state: "available",
+      });
+      const persisted = await pool.query<{ metadata: unknown }>(
+        "SELECT metadata FROM river_job WHERE id = $1::bigint",
+        [job.id.toString()]
+      );
+      expect(persisted.rows[0]?.metadata).toEqual(JSON.parse(metadata));
+    }
+  );
 
   it("acts on rows River can't fully read by ID and lists them like Go", async () => {
     const kind = `${filePrefix}_poison`;

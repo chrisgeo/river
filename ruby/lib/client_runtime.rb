@@ -103,7 +103,7 @@ module River
 
     def healthy?
       @mutex.synchronize do
-        @stop_requested || (@producer_threads.all? { |name, thread| @removed_queues[name] || thread.alive? } && (!@maintenance_thread || @maintenance_thread.alive?))
+        @stop_requested || (@producer_threads.all? { |name, thread| @removed_queues[name] || thread.alive? } && (!@maintenance_thread || @maintenance_thread.alive?) && (!@cancellation_thread || @cancellation_thread.alive?))
       end
     end
 
@@ -180,6 +180,9 @@ module River
         @started = true
         @stop_requested = false
         @stopped = false
+        thread = Thread.new { cancellation_loop }
+        @cancellation_thread = thread
+        @threads << thread
       end
 
       begin
@@ -224,6 +227,7 @@ module River
         @stopped = true
         @threads.clear
         @producer_threads.clear
+        @cancellation_thread = nil
         @maintenance_thread = nil
       end
 
@@ -262,8 +266,31 @@ module River
       raise Interrupted if should_interrupt
     end
 
-    private def check_remote_cancellations(queue)
-      entries = @mutex.synchronize { @running.select { |_id, entry| entry[:queue] == queue && entry[:working] } }
+    private def cancellation_loop
+      loop do
+        begin
+          check_remote_cancellations
+        rescue => error
+          @config.logger.error("River cancellation check failed: #{error.full_message}")
+        end
+
+        finished = @mutex.synchronize do
+          if @stop_requested && @running.empty?
+            true
+          else
+            interval = @queue_configs.values.map { |config| config.resolved_fetch_poll_interval(@config) }.min || @config.fetch_poll_interval
+            # Continue polling while producers drain, independently of fetches
+            # and their cooldowns. Completions and queue changes wake us early.
+            @condition.wait(@mutex, interval)
+            false
+          end
+        end
+        break if finished
+      end
+    end
+
+    private def check_remote_cancellations
+      entries = @mutex.synchronize { @running.select { |_id, entry| entry[:working] } }
       return if entries.empty?
 
       @driver.job_get_cancelled_ids(entries.keys).each do |id|
@@ -566,7 +593,6 @@ module River
         draining = queue_stopping?(queue)
         break if draining && running_count(queue).zero?
 
-        check_remote_cancellations(queue)
         if draining
           wait_for_running_jobs(queue, poll_interval)
           next

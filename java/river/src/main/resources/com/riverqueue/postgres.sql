@@ -57,6 +57,7 @@ DELETE FROM {schema}river_job WHERE id=? AND state != 'running' RETURNING {colum
 DELETE FROM {schema}river_job WHERE {where} AND id=? AND state != 'running' RETURNING {columns}
 -- name: retry
 UPDATE {schema}river_job SET state='available', finalized_at=NULL,
+metadata=CASE WHEN jsonb_typeof(metadata)='object' THEN metadata - 'cancel_attempted_at' ELSE metadata END,
 max_attempts=CASE WHEN attempt=max_attempts THEN max_attempts+1 ELSE max_attempts END, scheduled_at=?
 WHERE id=? AND state != 'running' AND NOT (state='available' AND scheduled_at < ?) RETURNING {columns}
 -- name: reset_jobs

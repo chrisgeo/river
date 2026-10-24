@@ -1231,6 +1231,16 @@ func (c *Client[TTx]) Start(ctx context.Context) error {
 		fetchCtx := withClient(fetchCtx, c)
 		workCtx = withClient(workCtx, c)
 
+		// Keep cancellation notifications and reconnects live until producers
+		// finish draining. The notifier is stopped with the other services below.
+		if c.notifier != nil {
+			if err := c.notifier.StartWithConnectContext(context.WithoutCancel(fetchCtx), fetchCtx); err != nil {
+				workCancel(err)
+				stopServicesOnError()
+				return err
+			}
+		}
+
 		if err := startstop.StartAll(fetchCtx, c.services...); err != nil {
 			workCancel(err)
 			stopServicesOnError()
@@ -2408,14 +2418,15 @@ func (c *Client[TTx]) producerAdd(queueName string, queueConfig QueueConfig) (*p
 }
 
 func (c *Client[TTx]) producerRemove(ctx context.Context, queueName string) error {
-	c.producersMu.Lock()
-	defer c.producersMu.Unlock()
-
+	c.producersMu.RLock()
 	producer, ok := c.producersByQueueName[queueName]
+	c.producersMu.RUnlock()
 	if !ok {
 		return &QueueNotFoundError{Name: queueName}
 	}
 
+	// QueueBundle serializes additions and removals. Keep the registry readable
+	// while draining so workers can still receive local cancellation requests.
 	shouldStop, stopped, finalizeStop := producer.StopInit()
 	if shouldStop {
 		select {
@@ -2427,7 +2438,9 @@ func (c *Client[TTx]) producerRemove(ctx context.Context, queueName string) erro
 		}
 	}
 
+	c.producersMu.Lock()
 	delete(c.producersByQueueName, queueName)
+	c.producersMu.Unlock()
 
 	return nil
 }
@@ -2815,7 +2828,7 @@ func (c *Client[TTx]) QueuePause(ctx context.Context, name string, opts *QueuePa
 		return err
 	}
 
-	c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+	c.notifyProducerWithoutListenerQueueControlEvent(ctx, name, controlEvent)
 
 	return nil
 }
@@ -2885,7 +2898,7 @@ func (c *Client[TTx]) QueueResume(ctx context.Context, name string, opts *QueueP
 		return err
 	}
 
-	c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+	c.notifyProducerWithoutListenerQueueControlEvent(ctx, name, controlEvent)
 
 	return nil
 }
@@ -2945,7 +2958,7 @@ func (c *Client[TTx]) QueueUpdate(ctx context.Context, name string, params *Queu
 		return nil, err
 	}
 
-	c.notifyProducerWithoutListenerQueueControlEvent(name, controlEvent)
+	c.notifyProducerWithoutListenerQueueControlEvent(ctx, name, controlEvent)
 
 	return queue, nil
 }
@@ -2967,20 +2980,17 @@ func (c *Client[TTx]) QueueUpdateTx(ctx context.Context, tx TTx, name string, pa
 // Should only ever be invoked *outside* a transaction. If invoked within a
 // transaction, the producer wouldn't yet be able to access the state that
 // triggered the notification because it's not committed yet.
-func (c *Client[TTx]) notifyProducerWithoutListenerQueueControlEvent(queue string, controlEvent *controlEventPayload) {
+func (c *Client[TTx]) notifyProducerWithoutListenerQueueControlEvent(ctx context.Context, queue string, controlEvent *controlEventPayload) {
 	if c.driver.SupportsListener() {
 		return
 	}
 
 	c.producersMu.RLock()
-	defer c.producersMu.RUnlock()
+	producer := c.producersByQueueName[queue]
+	c.producersMu.RUnlock()
 
-	if len(c.producersByQueueName) < 1 {
-		return
-	}
-
-	if producer, ok := c.producersByQueueName[queue]; ok {
-		producer.TriggerQueueControlEvent(controlEvent)
+	if producer != nil {
+		producer.TriggerQueueControlEvent(ctx, controlEvent)
 	}
 }
 
@@ -2998,7 +3008,7 @@ func (c *Client[TTx]) notifyProducerOfCancelWithoutNotifier(ctx context.Context,
 		return
 	}
 
-	state := producer.cancelState.Load()
+	state := producer.runState.Load()
 	if state == nil {
 		return
 	}

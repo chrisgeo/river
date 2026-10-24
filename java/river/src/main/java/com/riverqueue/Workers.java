@@ -90,6 +90,7 @@ public final class Workers implements AutoCloseable {
     unsubscribeInsert = river.onInsertCommit(wake::release);
     if (!config.pollOnly) executor.submit(this::listen);
     executor.submit(this::completeBatches);
+    executor.submit(this::pollCancellations);
     executor.submit(this::supervise);
     executor.submit(this::dispatch);
     if (config.leadership) executor.submit(this::elect);
@@ -230,7 +231,6 @@ public final class Workers implements AutoCloseable {
   private void dispatch() {
     long nextPoll = 0;
     long nextMaintenance = 0;
-    long nextCancelPoll = 0;
     while (running.get()) {
       try {
         long now = System.nanoTime();
@@ -257,25 +257,6 @@ public final class Workers implements AutoCloseable {
         if (now >= nextMaintenance) {
           queues.keySet().forEach(this::heartbeat);
           nextMaintenance = now + config.serviceInterval.toNanos();
-        }
-        if (now >= nextCancelPoll) {
-          river.transaction(
-              c -> {
-                try (var statement =
-                        Sql.prepare(c, Sql.query(river.database(), "cancel_requested"));
-                    var rows = statement.executeQuery()) {
-                  while (rows.next()) {
-                    var context = active.get(rows.getLong(1));
-                    if (context != null)
-                      context.requestCancellation(WorkContext.Cancellation.REMOTE);
-                  }
-                }
-                return null;
-              });
-          pendingCancellation
-              .entrySet()
-              .removeIf(entry -> now - entry.getValue() > Duration.ofMinutes(1).toNanos());
-          nextCancelPoll = now + TimeUnit.MILLISECONDS.toNanos(50);
         }
         if (wake.tryAcquire(10, TimeUnit.MILLISECONDS)) wake.release();
       } catch (InterruptedException e) {
@@ -1316,6 +1297,44 @@ public final class Workers implements AutoCloseable {
       } catch (Throwable error) {
         report(error);
       }
+  }
+
+  private void pollCancellations() {
+    // Fetches may block, and graceful stop ends dispatch before active work.
+    // Keep cancellation checks independent until every claimed attempt drains.
+    while (running.get() || dispatcherStopped.getCount() > 0 || !active.isEmpty()) {
+      try {
+        var attempts = Map.copyOf(active);
+        if (!attempts.isEmpty()) {
+          river.transaction(
+              c -> {
+                try (var statement =
+                        Sql.prepare(c, Sql.query(river.database(), "cancel_requested"));
+                    var rows = statement.executeQuery()) {
+                  while (rows.next()) {
+                    // A late query result must not cancel a subsequent attempt.
+                    var context = attempts.get(rows.getLong(1));
+                    if (context != null)
+                      context.requestCancellation(WorkContext.Cancellation.REMOTE);
+                  }
+                }
+                return null;
+              });
+        }
+        long now = System.nanoTime();
+        pendingCancellation
+            .entrySet()
+            .removeIf(entry -> now - entry.getValue() > Duration.ofMinutes(1).toNanos());
+      } catch (Exception e) {
+        report(e);
+      }
+      try {
+        TimeUnit.MILLISECONDS.sleep(50);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+    }
   }
 
   private void publish(Event event) {

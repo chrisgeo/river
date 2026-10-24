@@ -640,6 +640,47 @@ func exerciseJobUpdate[TTx any](ctx context.Context, t *testing.T, executorWithT
 			require.Equal(t, rivertype.JobStateAvailable, jobUpdated.State)
 		})
 
+		t.Run("PreservesInvalidMetadata", func(t *testing.T) {
+			t.Parallel()
+
+			exec, bundle := setup(ctx, t)
+			if bundle.driver.DatabaseName() != riverdriver.DatabaseNameSQLite {
+				t.Skip("only SQLite's JSON columns can hold invalid JSON")
+			}
+			job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{State: new(rivertype.JobStateRetryable)})
+			sqliteSetJobColumnMalformed(ctx, t, exec, job.ID, "metadata")
+
+			// Retry still validates its returned row, but the SQL must preserve
+			// malformed metadata and let the decoder report the invalid field.
+			_, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{ID: job.ID})
+			require.ErrorContains(t, err, "error unmarshaling `metadata`")
+			require.Equal(t, sqliteMalformedValue, sqliteJobColumnText(ctx, t, exec, job.ID, "metadata"))
+		})
+
+		t.Run("PreservesNonObjectMetadata", func(t *testing.T) {
+			t.Parallel()
+
+			for _, metadata := range []string{`["cancel_attempted_at"]`, `false`, `null`, `42`, `"cancel_attempted_at"`} {
+				t.Run(metadata, func(t *testing.T) {
+					t.Parallel()
+
+					exec, _ := setup(ctx, t)
+					job := testfactory.Job(ctx, t, exec, &testfactory.JobOpts{
+						Metadata: []byte(metadata),
+						State:    new(rivertype.JobStateRetryable),
+					})
+
+					jobAfter, err := exec.JobRetry(ctx, &riverdriver.JobRetryParams{ID: job.ID})
+					require.NoError(t, err)
+					require.Equal(t, rivertype.JobStateAvailable, jobAfter.State)
+					require.JSONEq(t, metadata, string(jobAfter.Metadata))
+					persisted, err := exec.JobGetByID(ctx, &riverdriver.JobGetByIDParams{ID: job.ID})
+					require.NoError(t, err)
+					require.JSONEq(t, metadata, string(persisted.Metadata))
+				})
+			}
+		})
+
 		t.Run("ReturnsErrNotFoundIfJobNotFound", func(t *testing.T) {
 			t.Parallel()
 

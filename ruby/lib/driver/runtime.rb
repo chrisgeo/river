@@ -235,7 +235,7 @@ module River::Driver
           UPDATE river_job
           SET state = 'available',
               max_attempts = CASE WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
-              metadata = #{runtime_postgres? ? "metadata - 'cancel_attempted_at'" : "jsonb_remove(metadata, '$.cancel_attempted_at')"},
+              metadata = #{runtime_postgres? ? "CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata - 'cancel_attempted_at' ELSE metadata END" : "CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE jsonb_remove(metadata, '$.cancel_attempted_at') END"},
               finalized_at = NULL,
               scheduled_at = #{runtime_time(now)}
           WHERE id = #{Integer(id)}

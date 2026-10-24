@@ -588,7 +588,8 @@ SET
     state = 'available',
     max_attempts = CASE WHEN attempt = max_attempts THEN max_attempts + 1 ELSE max_attempts END,
     finalized_at = NULL,
-    metadata = jsonb_remove(metadata, '$.cancel_attempted_at'),
+    metadata = CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata)
+        THEN metadata ELSE jsonb_remove(metadata, '$.cancel_attempted_at') END,
     scheduled_at = coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec'))
 WHERE id = @id
     -- Do not touch running jobs:
@@ -602,7 +603,25 @@ WHERE id = @id
         state <> 'available'
         OR scheduled_at > coalesce(cast(sqlc.narg('now') AS text), datetime('now', 'subsec'))
     )
-RETURNING *;
+RETURNING
+    id,
+    cast(CASE WHEN typeof(args) = 'text' AND NOT json_valid(args) THEN args ELSE json(args) END AS blob) AS args,
+    attempt,
+    attempted_at,
+    cast(CASE WHEN typeof(attempted_by) = 'text' AND NOT json_valid(attempted_by) THEN attempted_by ELSE json(attempted_by) END AS blob) AS attempted_by,
+    created_at,
+    cast(CASE WHEN typeof(errors) = 'text' AND NOT json_valid(errors) THEN errors ELSE json(errors) END AS blob) AS errors,
+    finalized_at,
+    kind,
+    max_attempts,
+    cast(CASE WHEN typeof(metadata) = 'text' AND NOT json_valid(metadata) THEN metadata ELSE json(metadata) END AS blob) AS metadata,
+    priority,
+    queue,
+    state,
+    scheduled_at,
+    cast(CASE WHEN typeof(tags) = 'text' AND NOT json_valid(tags) THEN tags ELSE json(tags) END AS blob) AS tags,
+    unique_key,
+    unique_states;
 
 -- Selects only the columns needed to schedule jobs so that a job with a JSON
 -- column that isn't valid JSON doesn't fail scheduling. See JobGetAvailable.
